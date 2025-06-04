@@ -1,4 +1,4 @@
-package luamigrate
+package golumn
 
 import (
 	"database/sql"
