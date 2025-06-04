@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	lua "github.com/yuin/gopher-lua"
 )
@@ -12,27 +13,13 @@ const (
 	luaMigrateModuleName   = "migrate"
 	luaTransactionTypeName = "transaction"
 	luaResultTypeName      = "result"
-	luaRowsTypeName        = "rows"
-	luaRowTypeName         = "row"
 )
-
-var isolationLevels = map[string]string{
-	"default":          "default",
-	"read_uncommitted": "read_uncommitted",
-	"read_committed":   "read_committed",
-	"write_committed":  "write_committed",
-	"repeatable_read":  "repeatable_read",
-	"snapshot":         "snapshot",
-	"serializable":     "serializable",
-	"linearizable":     "linearizable",
-}
 
 func LoaderFunc(db *sql.DB) func(L *lua.LState) int {
 	exports := map[string]lua.LGFunction{
-		"begin":     luaBeginFunc(db),
-		"exec":      luaExecFunc(db),
-		"query":     luaQueryFunc(db),
-		"query_row": luaQueryRowFunc(db),
+		"begin": luaBeginFunc(db),
+		"exec":  luaExecFunc(db),
+		"query": luaQueryFunc(db),
 	}
 
 	return func(l *lua.LState) int {
@@ -43,13 +30,6 @@ func LoaderFunc(db *sql.DB) func(L *lua.LState) int {
 		l.SetField(mtResult, "__index", l.SetFuncs(l.NewTable(), resultMethods))
 
 		moduleTable := l.SetFuncs(l.NewTable(), exports)
-
-		levelsTable := l.NewTable()
-		for k, v := range isolationLevels {
-			levelsTable.RawSetString(k, lua.LString(v))
-		}
-		l.SetField(moduleTable, "isolation_levels", levelsTable)
-
 		l.Push(moduleTable)
 		return 1
 	}
@@ -59,6 +39,7 @@ func luaBeginFunc(db *sql.DB) func(*lua.LState) int {
 	return func(l *lua.LState) int {
 		if db == nil {
 			l.RaiseError("DB connection (go *sql.DB) is nil")
+			return 0
 		}
 
 		optionsTable := l.OptTable(1, nil)
@@ -102,6 +83,7 @@ func luaBeginFunc(db *sql.DB) func(*lua.LState) int {
 					txOptions.ReadOnly = bool(readonly)
 				} else {
 					l.RaiseError("read_only must be a boolean")
+					return 0
 				}
 			}
 		}
@@ -113,9 +95,8 @@ func luaBeginFunc(db *sql.DB) func(*lua.LState) int {
 
 		tx, err := db.BeginTx(ctx, txOptions)
 		if err != nil {
-			l.Push(lua.LNil)
-			l.Push(lua.LString(fmt.Sprintf("begin transaction: %v", err)))
-			return 2
+			l.RaiseError("begin transaction: %v", err)
+			return 0
 		}
 
 		ud := l.NewUserData()
@@ -150,6 +131,87 @@ func luaExecFunc(db *sql.DB) func(*lua.LState) int {
 	}
 }
 
+func luaRowIterFunc(rows *sql.Rows) func(*lua.LState) int {
+	return func(l *lua.LState) int {
+		if !rows.Next() {
+			rows.Close()
+			l.Push(lua.LNil)
+			return 1
+		}
+
+		columns, err := rows.Columns()
+		if err != nil {
+			rows.Close()
+			l.RaiseError("get row columns: %v", err)
+			return 0
+		}
+
+		values := make([]any, len(columns))
+		scanArgs := make([]any, len(values))
+		for i := range values {
+			scanArgs[i] = &values[i]
+		}
+
+		err = rows.Scan(scanArgs...)
+		if err != nil {
+			rows.Close()
+			l.RaiseError("scan row: %v", err)
+			return 0
+		}
+
+		rowTable := l.CreateTable(0, len(columns))
+		for i, name := range columns {
+			goValue := values[i]
+			var luaValue lua.LValue
+
+			if goValue == nil {
+				luaValue = lua.LNil
+			} else {
+				switch v := goValue.(type) {
+				case bool:
+					luaValue = lua.LBool(v)
+				case []byte:
+					luaValue = lua.LString(string(v))
+				case string:
+					luaValue = lua.LString(v)
+				case int:
+					luaValue = lua.LNumber(v)
+				case int8:
+					luaValue = lua.LNumber(v)
+				case int16:
+					luaValue = lua.LNumber(v)
+				case int32:
+					luaValue = lua.LNumber(v)
+				case int64:
+					luaValue = lua.LNumber(v)
+				case uint:
+					luaValue = lua.LNumber(v)
+				case uint8:
+					luaValue = lua.LNumber(v)
+				case uint16:
+					luaValue = lua.LNumber(v)
+				case uint32:
+					luaValue = lua.LNumber(v)
+				case uint64:
+					luaValue = lua.LNumber(v)
+				case float32:
+					luaValue = lua.LNumber(v)
+				case float64:
+					luaValue = lua.LNumber(v)
+				case time.Time:
+					luaValue = lua.LString(v.Format(time.RFC3339Nano))
+				default:
+					l.RaiseError("unsupported go type '%T' for column '%s'", v, name)
+					return 0
+				}
+			}
+			l.SetField(rowTable, name, luaValue)
+		}
+		l.Push(rowTable)
+		return 1
+	}
+}
+
 func luaQueryFunc(db *sql.DB) func(*lua.LState) int {
 	return func(l *lua.LState) int {
 		q, args := checkQueryArgs(l, 1)
@@ -161,44 +223,20 @@ func luaQueryFunc(db *sql.DB) func(*lua.LState) int {
 
 		rows, err := db.QueryContext(ctx, q, args...)
 		if err != nil {
-			l.Push(lua.LNil)
-			l.Push(lua.LString(fmt.Sprintf("query: %v", err)))
-			return 2
+			l.RaiseError("query: %v", err)
+			return 0
 		}
 
-		ud := l.NewUserData()
-		ud.Value = rows
-		l.SetMetatable(ud, l.GetTypeMetatable(luaRowsTypeName))
-		l.Push(ud)
-		return 1
-	}
-}
-
-func luaQueryRowFunc(db *sql.DB) func(*lua.LState) int {
-	return func(l *lua.LState) int {
-		q, args := checkQueryArgs(l, 1)
-
-		ctx := l.Context()
-		if ctx == nil {
-			ctx = context.Background()
-		}
-
-		row := db.QueryRowContext(ctx, q, args...)
-
-		ud := l.NewUserData()
-		ud.Value = row
-		l.SetMetatable(ud, l.GetTypeMetatable(luaRowTypeName))
-		l.Push(ud)
+		l.Push(l.NewFunction(luaRowIterFunc(rows)))
 		return 1
 	}
 }
 
 var transactionMethods = map[string]lua.LGFunction{
-	"exec":      luaTransactionExec,
-	"query":     luaTransactionQuery,
-	"query_row": luaTransactionQueryRow,
-	"commit":    luaTransactionCommit,
-	"rollback":  luaTransactionRollback,
+	"exec":     luaTransactionExec,
+	"query":    luaTransactionQuery,
+	"commit":   luaTransactionCommit,
+	"rollback": luaTransactionRollback,
 }
 
 func checkTransaction(l *lua.LState) *sql.Tx {
@@ -221,9 +259,8 @@ func luaTransactionExec(l *lua.LState) int {
 
 	res, err := tx.ExecContext(ctx, q, args...)
 	if err != nil {
-		l.Push(lua.LNil)
-		l.Push(lua.LString(fmt.Sprintf("exec: %v", err)))
-		return 2
+		l.RaiseError("exec: %v", err)
+		return 0
 	}
 
 	ud := l.NewUserData()
@@ -244,42 +281,19 @@ func luaTransactionQuery(l *lua.LState) int {
 
 	rows, err := tx.QueryContext(ctx, q, args...)
 	if err != nil {
-		l.Push(lua.LNil)
-		l.Push(lua.LString(fmt.Sprintf("query: %v", err)))
-		return 2
+		l.RaiseError("query: %v", err)
+		return 0
 	}
 
-	ud := l.NewUserData()
-	ud.Value = rows
-	l.SetMetatable(ud, l.GetTypeMetatable(luaRowsTypeName))
-	l.Push(ud)
-	return 1
-}
-
-func luaTransactionQueryRow(l *lua.LState) int {
-	tx := checkTransaction(l)
-	q, args := checkQueryArgs(l, 1)
-
-	ctx := l.Context()
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	row := tx.QueryRowContext(ctx, q, args...)
-
-	ud := l.NewUserData()
-	ud.Value = row
-	l.SetMetatable(ud, l.GetTypeMetatable(luaRowTypeName))
-	l.Push(ud)
+	l.Push(l.NewFunction(luaRowIterFunc(rows)))
 	return 1
 }
 
 func luaTransactionCommit(l *lua.LState) int {
 	tx := checkTransaction(l)
 	if err := tx.Commit(); err != nil {
-		l.Push(lua.LFalse)
-		l.Push(lua.LString(fmt.Sprintf("commit transaction: %v", err)))
-		return 2
+		l.RaiseError("commit transaction: %v", err)
+		return 0
 	}
 	l.Push(lua.LTrue)
 	return 1
@@ -288,9 +302,8 @@ func luaTransactionCommit(l *lua.LState) int {
 func luaTransactionRollback(l *lua.LState) int {
 	tx := checkTransaction(l)
 	if err := tx.Rollback(); err != nil {
-		l.Push(lua.LFalse)
-		l.Push(lua.LString(fmt.Sprintf("rollback transaction: %v", err)))
-		return 2
+		l.RaiseError("rollback transaction: %v", err)
+		return 0
 	}
 	l.Push(lua.LTrue)
 	return 1
@@ -301,36 +314,36 @@ var resultMethods = map[string]lua.LGFunction{
 	"rows_affected":  luaResultRowsAffected,
 }
 
-func luaResultLastInsertId(l *lua.LState) int { return 0 }
-
-func luaResultRowsAffected(l *lua.LState) int { return 0 }
-
-var rowsMethods = map[string]lua.LGFunction{
-	"close":   luaRowsClose,
-	"columns": luaRowsColumns,
-	"err":     luaRowsErr,
-	"next":    luaRowsNext,
-	"scan":    luaRowsScan,
+func checkResult(l *lua.LState) sql.Result {
+	ud := l.CheckUserData(1)
+	if v, ok := ud.Value.(sql.Result); ok {
+		return v
+	}
+	l.ArgError(1, "Result expected")
+	return nil
 }
 
-func luaRowsClose(l *lua.LState) int { return 0 }
-
-func luaRowsColumns(l *lua.LState) int { return 0 }
-
-func luaRowsErr(l *lua.LState) int { return 0 }
-
-func luaRowsNext(l *lua.LState) int { return 0 }
-
-func luaRowsScan(l *lua.LState) int { return 0 }
-
-var rowMethods = map[string]lua.LGFunction{
-	"scan": luaRowScan,
-	"err":  luaRowErr,
+func luaResultLastInsertId(l *lua.LState) int {
+	res := checkResult(l)
+	id, err := res.LastInsertId()
+	if err != nil {
+		l.RaiseError("get last insert id: %v", err)
+		return 0
+	}
+	l.Push(lua.LNumber(id))
+	return 1
 }
 
-func luaRowScan(l *lua.LState) int { return 0 }
-
-func luaRowErr(l *lua.LState) int { return 0 }
+func luaResultRowsAffected(l *lua.LState) int {
+	res := checkResult(l)
+	id, err := res.RowsAffected()
+	if err != nil {
+		l.RaiseError("get rows affected: %v", err)
+		return 0
+	}
+	l.Push(lua.LNumber(id))
+	return 1
+}
 
 func checkQueryArgs(l *lua.LState, start int) (string, []any) {
 	q := l.CheckString(start)
