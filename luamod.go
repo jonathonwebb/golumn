@@ -30,7 +30,7 @@ var isolationLevels = map[string]string{
 func LoaderFunc(db *sql.DB) func(L *lua.LState) int {
 	exports := map[string]lua.LGFunction{
 		"begin":     luaBeginFunc(db),
-		"execute":   luaExecuteFunc(db),
+		"exec":      luaExecFunc(db),
 		"query":     luaQueryFunc(db),
 		"query_row": luaQueryRowFunc(db),
 	}
@@ -126,7 +126,7 @@ func luaBeginFunc(db *sql.DB) func(*lua.LState) int {
 	}
 }
 
-func luaExecuteFunc(db *sql.DB) func(*lua.LState) int {
+func luaExecFunc(db *sql.DB) func(*lua.LState) int {
 	return func(l *lua.LState) int {
 		q, args := checkQueryArgs(l, 1)
 
@@ -194,7 +194,7 @@ func luaQueryRowFunc(db *sql.DB) func(*lua.LState) int {
 }
 
 var transactionMethods = map[string]lua.LGFunction{
-	"execute":   luaTransactionExecute,
+	"exec":      luaTransactionExec,
 	"query":     luaTransactionQuery,
 	"query_row": luaTransactionQueryRow,
 	"commit":    luaTransactionCommit,
@@ -210,11 +210,69 @@ func checkTransaction(l *lua.LState) *sql.Tx {
 	return nil
 }
 
-func luaTransactionExecute(l *lua.LState) int { return 0 }
+func luaTransactionExec(l *lua.LState) int {
+	tx := checkTransaction(l)
+	q, args := checkQueryArgs(l, 2)
 
-func luaTransactionQuery(l *lua.LState) int { return 0 }
+	ctx := l.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
-func luaTransactionQueryRow(l *lua.LState) int { return 0 }
+	res, err := tx.ExecContext(ctx, q, args...)
+	if err != nil {
+		l.Push(lua.LNil)
+		l.Push(lua.LString(fmt.Sprintf("exec: %v", err)))
+		return 2
+	}
+
+	ud := l.NewUserData()
+	ud.Value = res
+	l.SetMetatable(ud, l.GetTypeMetatable(luaResultTypeName))
+	l.Push(ud)
+	return 1
+}
+
+func luaTransactionQuery(l *lua.LState) int {
+	tx := checkTransaction(l)
+	q, args := checkQueryArgs(l, 2)
+
+	ctx := l.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	rows, err := tx.QueryContext(ctx, q, args...)
+	if err != nil {
+		l.Push(lua.LNil)
+		l.Push(lua.LString(fmt.Sprintf("query: %v", err)))
+		return 2
+	}
+
+	ud := l.NewUserData()
+	ud.Value = rows
+	l.SetMetatable(ud, l.GetTypeMetatable(luaRowsTypeName))
+	l.Push(ud)
+	return 1
+}
+
+func luaTransactionQueryRow(l *lua.LState) int {
+	tx := checkTransaction(l)
+	q, args := checkQueryArgs(l, 1)
+
+	ctx := l.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	row := tx.QueryRowContext(ctx, q, args...)
+
+	ud := l.NewUserData()
+	ud.Value = row
+	l.SetMetatable(ud, l.GetTypeMetatable(luaRowTypeName))
+	l.Push(ud)
+	return 1
+}
 
 func luaTransactionCommit(l *lua.LState) int {
 	tx := checkTransaction(l)
