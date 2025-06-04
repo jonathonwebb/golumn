@@ -56,17 +56,39 @@ function Transaction:query(q, ...) end
 ---@return table
 function Transaction:query_row(q, ...) end
 
----@return boolean
+---@return boolean, string?
 function Transaction:commit() end
 
----@return boolean
+---@return boolean, string?
 function Transaction:rollback() end
 
 ---@module 'transaction'
-local M = {}
+local M = {
+    isolation_level = {
+        default = "default",
+        read_uncommitted = "read_uncommitted",
+        read_committed = "read_committed",
+        write_committed = "write_committed",
+        repeatable_read = "repeatable_read",
+        snapshot = "snapshot",
+        serializable = "serializable",
+        linearizable = "linearizable",
+    }
+}
 
----@return Transaction
-function M.begin() end
+---@alias IsolationLevel
+---| '"default"'
+---| '"read_uncommitted"'
+---| '"read_committed"'
+---| '"write_committed"'
+---| '"repeatable_read"'
+---| '"snapshot"'
+---| '"serializable"'
+---| '"linearizable"'
+
+---@param options? { isolation_level?: IsolationLevel, read_only?: boolean }
+---@return Transaction?, string?
+function M.begin(options) end
 
 ---@param q string
 ---@param ... any?
