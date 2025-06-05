@@ -3,33 +3,25 @@ package golumn
 import (
 	"context"
 	"database/sql"
+	"fmt"
 )
 
-type Migration interface {
-	Id() int
-	Label() string
-	Up() func(context.Context, *sql.DB, ...any) error
-	Down() func(context.Context, *sql.DB, ...any) error
+type Migration struct {
+	Version  int64
+	UpFunc   func(context.Context, *sql.DB) error
+	DownFunc func(context.Context, *sql.DB) error
 }
 
-type LuaMigration struct {
-	id    int
-	label string
-	path  string
+func (m *Migration) Up(ctx context.Context, db *sql.DB) error {
+	if m.UpFunc == nil {
+		return fmt.Errorf("migration %d: missing up func", m.Version)
+	}
+	return m.UpFunc(ctx, db)
 }
 
-func (lm *LuaMigration) Id() int {
-	return lm.id
-}
-
-func (lm *LuaMigration) Label() string {
-	return lm.label
-}
-
-func (lm *LuaMigration) Up(ctx context.Context, db *sql.DB, a ...any) error {
-	return nil
-}
-
-func (lm *LuaMigration) Down(ctx context.Context, db *sql.DB, a ...any) error {
-	return nil
+func (m *Migration) Down(ctx context.Context, db *sql.DB) error {
+	if m.DownFunc == nil {
+		return fmt.Errorf("migration %d: missing down func", m.Version)
+	}
+	return m.DownFunc(ctx, db)
 }
