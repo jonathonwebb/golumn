@@ -1,3 +1,3 @@
 # golumn
 
-Write your Go application's database migrations in embedded Lua.
+> Script Go database migrations with embedded Lua.
