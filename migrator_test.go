@@ -3,12 +3,12 @@ package golumn_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/jonathonwebb/golumn"
 )
 
@@ -132,440 +132,312 @@ func (s *fakeStore) Remove(ctx context.Context, v int64) error {
 
 func noopMigration(ctx context.Context, db *sql.DB) error { return nil }
 
+func errorMigration(msg string) func(context.Context, *sql.DB) error {
+	return func(_ context.Context, _ *sql.DB) error {
+		return errors.New(msg)
+	}
+}
+
+// Helper to create standard migrations for testing
+func createMigrations(versions ...int64) []*golumn.Migration {
+	migrations := make([]*golumn.Migration, len(versions))
+	for i, v := range versions {
+		migrations[i] = &golumn.Migration{
+			Version:  v,
+			UpFunc:   noopMigration,
+			DownFunc: noopMigration,
+		}
+	}
+	return migrations
+}
+
 func TestMigrator_Up(t *testing.T) {
-	cases := []struct {
+	tests := []struct {
 		name              string
-		store             *fakeStore
+		initialVersions   []int64
 		migrations        []*golumn.Migration
-		to                int64
+		target            int64
 		holdLockOnFailure bool
+		storeConfig       func(*fakeStore) // Configure store behavior
 
 		wantErr      bool
 		wantVersions []int64
 		wantApplied  []int64
 		wantLocked   bool
 	}{
+		// Basic scenarios
 		{
-			name: "none",
-			store: &fakeStore{
-				versions: []int64{},
-			},
-			migrations: []*golumn.Migration{},
-			to:         0,
-
-			wantVersions: []int64{},
-			wantApplied:  []int64{},
+			name:            "no_migrations_no_target",
+			initialVersions: []int64{},
+			migrations:      []*golumn.Migration{},
+			target:          0,
+			wantVersions:    []int64{},
+			wantApplied:     []int64{},
 		},
 		{
-			name: "none_applied",
-			store: &fakeStore{
-				versions: []int64{},
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 3,
-
-			wantVersions: []int64{1, 2, 3},
-			wantApplied:  []int64{1, 2, 3},
+			name:            "fresh_database_apply_all",
+			initialVersions: []int64{},
+			migrations:      createMigrations(1, 2, 3),
+			target:          3,
+			wantVersions:    []int64{1, 2, 3},
+			wantApplied:     []int64{1, 2, 3},
 		},
 		{
-			name: "some_applied",
-			store: &fakeStore{
-				versions: []int64{1},
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 3,
-
-			wantVersions: []int64{1, 2, 3},
-			wantApplied:  []int64{2, 3},
+			name:            "partial_applied_continue",
+			initialVersions: []int64{1},
+			migrations:      createMigrations(1, 2, 3),
+			target:          3,
+			wantVersions:    []int64{1, 2, 3},
+			wantApplied:     []int64{2, 3},
 		},
 		{
-			name: "all_applied",
-			store: &fakeStore{
-				versions: []int64{1, 2, 3},
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 3,
-
-			wantVersions: []int64{1, 2, 3},
-			wantApplied:  []int64{},
+			name:            "all_already_applied",
+			initialVersions: []int64{1, 2, 3},
+			migrations:      createMigrations(1, 2, 3),
+			target:          3,
+			wantVersions:    []int64{1, 2, 3},
+			wantApplied:     []int64{}, // Nothing new applied
 		},
 		{
-			name:  "negative_version",
-			store: &fakeStore{},
+			name:            "target_below_current_version",
+			initialVersions: []int64{1, 2, 3},
+			migrations:      createMigrations(1, 2, 3),
+			target:          2,
+			wantVersions:    []int64{1, 2, 3},
+			wantApplied:     []int64{}, // No migrations applied
+		},
+
+		// Version selection scenarios
+		{
+			name:            "skip_to_specific_version",
+			initialVersions: []int64{1},
+			migrations:      createMigrations(1, 2, 3, 4),
+			target:          3,
+			wantVersions:    []int64{1, 2, 3},
+			wantApplied:     []int64{2, 3},
+		},
+		{
+			name:            "gaps_in_migration_versions",
+			initialVersions: []int64{},
+			migrations:      createMigrations(1, 5, 10),
+			target:          10,
+			wantVersions:    []int64{1, 5, 10},
+			wantApplied:     []int64{1, 5, 10},
+		},
+		{
+			name:            "target_version_not_in_migrations",
+			initialVersions: []int64{},
+			migrations:      createMigrations(1, 2, 4),
+			target:          3,
+			wantVersions:    []int64{1, 2},
+			wantApplied:     []int64{1, 2},
+		},
+
+		// Migration validation errors
+		{
+			name:            "negative_version",
+			initialVersions: []int64{},
 			migrations: []*golumn.Migration{
 				{Version: -1, UpFunc: noopMigration, DownFunc: noopMigration},
 				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
 			},
-			to: 3,
-
+			target:       1,
+			wantErr:      true,
 			wantVersions: []int64{},
 			wantApplied:  []int64{},
-			wantErr:      true,
 		},
 		{
-			name:  "misordered",
-			store: &fakeStore{},
+			name:            "misordered_migrations",
+			initialVersions: []int64{},
 			migrations: []*golumn.Migration{
 				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
 				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
 				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
 			},
-			to: 3,
-
+			target:       3,
+			wantErr:      true,
 			wantVersions: []int64{},
 			wantApplied:  []int64{},
-			wantErr:      true,
 		},
 		{
-			name:  "duplicate",
-			store: &fakeStore{},
+			name:            "duplicate_versions",
+			initialVersions: []int64{},
 			migrations: []*golumn.Migration{
 				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
 				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
 				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
 			},
-			to: 3,
-
+			target:       3,
+			wantErr:      true,
 			wantVersions: []int64{},
 			wantApplied:  []int64{},
-			wantErr:      true,
 		},
-		{
-			name: "init_err",
-			store: &fakeStore{
-				initFunc: func(ctx context.Context, _ *fakeStore) error { return fmt.Errorf("test init error") },
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 3,
 
+		// Store operation errors
+		{
+			name:            "store_init_error",
+			initialVersions: []int64{},
+			migrations:      createMigrations(1, 2, 3),
+			target:          3,
+			storeConfig: func(s *fakeStore) {
+				s.initFunc = func(ctx context.Context, _ *fakeStore) error {
+					return fmt.Errorf("init error")
+				}
+			},
+			wantErr:      true,
 			wantVersions: []int64{},
 			wantApplied:  []int64{},
-			wantErr:      true,
 		},
 		{
-			name: "lock_err",
-			store: &fakeStore{
-				lockFunc: func(ctx context.Context, _ *fakeStore) error { return fmt.Errorf("test lock error") },
+			name:            "store_lock_error",
+			initialVersions: []int64{},
+			migrations:      createMigrations(1, 2, 3),
+			target:          3,
+			storeConfig: func(s *fakeStore) {
+				s.lockFunc = func(ctx context.Context, _ *fakeStore) error {
+					return fmt.Errorf("lock error")
+				}
 			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 3,
-
+			wantErr:      true,
 			wantVersions: []int64{},
 			wantApplied:  []int64{},
-			wantErr:      true,
 		},
 		{
-			name: "release_err",
-			store: &fakeStore{
-				releaseFunc: func(ctx context.Context, _ *fakeStore) error { return fmt.Errorf("test release error") },
+			name:            "store_already_locked",
+			initialVersions: []int64{},
+			migrations:      createMigrations(1),
+			target:          1,
+			storeConfig: func(s *fakeStore) {
+				s.locked = true
 			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
+			wantErr:      true,
+			wantVersions: []int64{},
+			wantApplied:  []int64{},
+			wantLocked:   true,
+		},
+		{
+			name:            "store_version_error",
+			initialVersions: []int64{},
+			migrations:      createMigrations(1, 2, 3),
+			target:          3,
+			storeConfig: func(s *fakeStore) {
+				s.versionFunc = func(ctx context.Context, s *fakeStore) (int64, error) {
+					return 0, fmt.Errorf("version error")
+				}
 			},
-			to: 3,
-
+			wantErr:      true,
+			wantVersions: []int64{},
+			wantApplied:  []int64{},
+		},
+		{
+			name:            "store_insert_error",
+			initialVersions: []int64{},
+			migrations:      createMigrations(1, 2, 3),
+			target:          3,
+			storeConfig: func(s *fakeStore) {
+				s.insertFunc = func(ctx context.Context, v int64, s *fakeStore) error {
+					if s.insertCalls == 2 { // Fail on second migration
+						return fmt.Errorf("insert error")
+					}
+					return defaultInsertFunc(ctx, v, s)
+				}
+			},
+			wantErr:      true,
+			wantVersions: []int64{1},
+			wantApplied:  []int64{1},
+		},
+		{
+			name:            "store_release_error",
+			initialVersions: []int64{},
+			migrations:      createMigrations(1, 2, 3),
+			target:          3,
+			storeConfig: func(s *fakeStore) {
+				s.releaseFunc = func(ctx context.Context, _ *fakeStore) error {
+					return fmt.Errorf("release error")
+				}
+			},
+			wantErr:      true, // Should get joined error
 			wantVersions: []int64{1, 2, 3},
 			wantApplied:  []int64{1, 2, 3},
 			wantLocked:   true,
-			wantErr:      true,
 		},
+
+		// Migration execution errors
 		{
-			name: "version_err",
-			store: &fakeStore{
-				versionFunc: func(ctx context.Context, s *fakeStore) (int64, error) { return 0, fmt.Errorf("test version error") },
-			},
+			name:            "migration_up_error",
+			initialVersions: []int64{},
 			migrations: []*golumn.Migration{
 				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
+				{Version: 2, UpFunc: errorMigration("up error"), DownFunc: noopMigration},
 				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
 			},
-			to: 3,
-
-			wantVersions: []int64{},
-			wantApplied:  []int64{},
+			target:       3,
 			wantErr:      true,
-		},
-		{
-			name: "version_err",
-			store: &fakeStore{
-				versionFunc: func(ctx context.Context, s *fakeStore) (int64, error) { return 0, fmt.Errorf("test version error") },
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 3,
-
-			wantVersions: []int64{},
-			wantApplied:  []int64{},
-			wantErr:      true,
-		},
-		{
-			name: "insert_err",
-			store: &fakeStore{
-				insertFunc: func(ctx context.Context, v int64, s *fakeStore) error {
-					if s.insertCalls == 2 {
-						return fmt.Errorf("test insert error")
-					}
-					return defaultInsertFunc(ctx, v, s)
-				},
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 3,
-
 			wantVersions: []int64{1},
 			wantApplied:  []int64{1},
-			wantErr:      true,
 		},
 		{
-			name:  "up_err",
-			store: &fakeStore{},
+			name:            "migration_up_error_hold_lock",
+			initialVersions: []int64{},
 			migrations: []*golumn.Migration{
 				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: func(_ context.Context, _ *sql.DB) error { return fmt.Errorf("test up migration error") }, DownFunc: noopMigration},
+				{Version: 2, UpFunc: errorMigration("up error"), DownFunc: noopMigration},
 				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
 			},
-			to: 3,
-
-			wantVersions: []int64{1},
-			wantApplied:  []int64{1},
-			wantErr:      true,
-		},
-		{
-			name:  "up_err_hold_lock",
-			store: &fakeStore{},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: func(_ context.Context, _ *sql.DB) error { return fmt.Errorf("test up migration error") }, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
+			target:            3,
 			holdLockOnFailure: true,
-			to:                3,
-
-			wantVersions: []int64{1},
-			wantApplied:  []int64{1},
-			wantErr:      true,
-			wantLocked:   true,
-		},
-		{
-			name: "skip_to_specific_version",
-			store: &fakeStore{
-				versions: []int64{1},
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 4, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 3, // Skip version 4
-
-			wantVersions: []int64{1, 2, 3},
-			wantApplied:  []int64{2, 3},
-		},
-		{
-			name: "target_version_zero",
-			store: &fakeStore{
-				versions: []int64{},
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 0,
-
-			wantVersions: []int64{},
-			wantApplied:  []int64{},
-		},
-		{
-			name: "target_below_current_version",
-			store: &fakeStore{
-				versions: []int64{1, 2, 3},
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 2,
-
-			wantVersions: []int64{1, 2, 3},
-			wantApplied:  []int64{},
-		},
-		{
-			name: "initial_version_error_handling",
-			store: &fakeStore{
-				versions: []int64{},
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 2,
-
-			wantVersions: []int64{1, 2},
-			wantApplied:  []int64{1, 2},
-		},
-		{
-			name: "gap_in_migration_versions",
-			store: &fakeStore{
-				versions: []int64{},
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 5, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 10, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 10,
-
-			wantVersions: []int64{1, 5, 10},
-			wantApplied:  []int64{1, 5, 10},
-		},
-		{
-			name: "target_version_not_in_migrations",
-			store: &fakeStore{
-				versions: []int64{},
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 4, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 3,
-
-			wantVersions: []int64{1, 2},
-			wantApplied:  []int64{1, 2},
-		},
-		{
-			name: "single_migration_application",
-			store: &fakeStore{
-				versions: []int64{1, 2},
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 4, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 3,
-
-			wantVersions: []int64{1, 2, 3},
-			wantApplied:  []int64{3},
-		},
-		{
-			name: "empty_migrations_with_target",
-			store: &fakeStore{
-				versions: []int64{},
-			},
-			migrations: []*golumn.Migration{},
-			to:         5,
-
-			wantVersions: []int64{},
-			wantApplied:  []int64{},
-		},
-		{
-			name: "locked",
-			store: &fakeStore{
-				locked: true,
-				lockFunc: func(ctx context.Context, s *fakeStore) error {
-					return golumn.ErrLocked
-				},
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 1,
-
-			wantVersions: []int64{},
-			wantApplied:  []int64{},
-			wantErr:      true,
-			wantLocked:   true,
+			wantErr:           true,
+			wantVersions:      []int64{1},
+			wantApplied:       []int64{1},
+			wantLocked:        true,
 		},
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			m := &golumn.Migrator{
-				Store:             tc.store,
-				Sources:           tc.migrations,
-				HoldLockOnFailure: tc.holdLockOnFailure,
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &fakeStore{
+				versions: slices.Clone(tt.initialVersions),
 			}
-			err := m.Up(t.Context(), tc.to)
-
-			if tc.wantErr && err == nil {
-				t.Errorf("%s: wanted err != nil, but got nil", tc.name)
-			}
-			if !tc.wantErr && err != nil {
-				t.Errorf("%s: wanted err = nil, but got %v", tc.name, err)
+			if tt.storeConfig != nil {
+				tt.storeConfig(store)
 			}
 
-			if !slices.Equal(tc.wantVersions, tc.store.versions) {
-				diff := cmp.Diff(tc.wantVersions, tc.store.versions)
-				t.Errorf("%s: store.versions mismatch (-want, +got):\n%s", tc.name, diff)
+			migrator := &golumn.Migrator{
+				Store:             store,
+				Sources:           tt.migrations,
+				HoldLockOnFailure: tt.holdLockOnFailure,
 			}
 
-			if !slices.Equal(tc.wantApplied, tc.store.applied) {
-				diff := cmp.Diff(tc.wantApplied, tc.store.applied)
-				t.Errorf("%s: store.applied mismatch (-want, +got):\n%s", tc.name, diff)
+			err := migrator.Up(context.Background(), tt.target)
+
+			if tt.wantErr && err == nil {
+				t.Errorf("expected error but got none")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("expected no error but got: %v", err)
 			}
 
-			if tc.wantLocked != tc.store.locked {
-				t.Errorf("%s: wanted store.locked = %v, but got %v", tc.name, tc.wantLocked, tc.store.locked)
+			if !slices.Equal(tt.wantVersions, store.versions) {
+				t.Errorf("versions mismatch\nwant: %v\ngot:  %v", tt.wantVersions, store.versions)
+			}
+			if !slices.Equal(tt.wantApplied, store.applied) {
+				t.Errorf("applied mismatch\nwant: %v\ngot:  %v", tt.wantApplied, store.applied)
+			}
+			if tt.wantLocked != store.locked {
+				t.Errorf("lock state mismatch: want %v, got %v", tt.wantLocked, store.locked)
 			}
 		})
-	}
-
-	migrations := []*golumn.Migration{
-		{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-		{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-		{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-	}
-
-	migrator := &golumn.Migrator{
-		Store:   &fakeStore{},
-		Sources: migrations,
-	}
-
-	if err := migrator.Up(t.Context(), 2); err != nil {
-		t.Error(err)
 	}
 }
 
 func TestMigrator_Down(t *testing.T) {
-	cases := []struct {
+	tests := []struct {
 		name              string
-		store             *fakeStore
+		initialVersions   []int64
 		migrations        []*golumn.Migration
-		to                int64
+		target            int64
 		holdLockOnFailure bool
+		storeConfig       func(*fakeStore)
 
 		wantErr      bool
 		wantVersions []int64
@@ -573,347 +445,513 @@ func TestMigrator_Down(t *testing.T) {
 		wantLocked   bool
 	}{
 		{
-			name: "none_to_revert",
-			store: &fakeStore{
-				versions: []int64{1},
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 1,
-
-			wantVersions: []int64{1},
-			wantReverted: []int64{},
+			name:            "no_migrations_to_revert",
+			initialVersions: []int64{1},
+			migrations:      createMigrations(1, 2, 3),
+			target:          1,
+			wantVersions:    []int64{1},
+			wantReverted:    []int64{},
 		},
 		{
-			name: "revert_all",
-			store: &fakeStore{
-				versions: []int64{1, 2, 3},
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: -1,
-
-			wantVersions: []int64{},
-			wantReverted: []int64{3, 2, 1},
+			name:            "revert_all_migrations",
+			initialVersions: []int64{1, 2, 3},
+			migrations:      createMigrations(1, 2, 3),
+			target:          -1, // Special value to revert all
+			wantVersions:    []int64{},
+			wantReverted:    []int64{3, 2, 1},
 		},
 		{
-			name: "revert_partial",
-			store: &fakeStore{
-				versions: []int64{1, 2, 3},
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 1,
-
-			wantVersions: []int64{1},
-			wantReverted: []int64{3, 2},
+			name:            "revert_partial_migrations",
+			initialVersions: []int64{1, 2, 3},
+			migrations:      createMigrations(1, 2, 3),
+			target:          1,
+			wantVersions:    []int64{1},
+			wantReverted:    []int64{3, 2},
 		},
 		{
-			name: "already_at_target",
-			store: &fakeStore{
-				versions: []int64{1, 2},
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 2,
-
-			wantVersions: []int64{1, 2},
-			wantReverted: []int64{},
+			name:            "already_at_target_version",
+			initialVersions: []int64{1, 2},
+			migrations:      createMigrations(1, 2, 3),
+			target:          2,
+			wantVersions:    []int64{1, 2},
+			wantReverted:    []int64{},
 		},
 		{
-			name: "target_below_current",
-			store: &fakeStore{
-				versions: []int64{1, 2, 3},
+			name:            "empty_database",
+			initialVersions: []int64{},
+			migrations:      createMigrations(1, 2, 3),
+			target:          1,
+			wantVersions:    []int64{},
+			wantReverted:    []int64{},
+		},
+		{
+			name:            "target_below_zero_but_not_negative_one",
+			initialVersions: []int64{1, 2, 3},
+			migrations:      createMigrations(1, 2, 3),
+			target:          0,
+			wantErr:         true,
+			wantVersions:    []int64{1, 2, 3},
+			wantReverted:    []int64{},
+		},
+		{
+			name:            "target_version_not_in_migrations",
+			initialVersions: []int64{1, 2, 3},
+			migrations:      createMigrations(1, 2, 3),
+			target:          5,
+			wantErr:         true,
+			wantVersions:    []int64{1, 2, 3},
+			wantReverted:    []int64{},
+		},
+		{
+			name:            "missing_remote_version_migration",
+			initialVersions: []int64{1, 2, 5},
+			migrations:      createMigrations(1, 2, 3),
+			target:          1,
+			wantErr:         true,
+			wantVersions:    []int64{1, 2, 5},
+			wantReverted:    []int64{},
+		},
+		{
+			name:            "store_version_error_initial",
+			initialVersions: []int64{1, 2, 3},
+			migrations:      createMigrations(1, 2, 3),
+			target:          1,
+			storeConfig: func(s *fakeStore) {
+				s.versionFunc = func(ctx context.Context, s *fakeStore) (int64, error) {
+					return 0, fmt.Errorf("version error")
+				}
 			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 0,
-
 			wantErr:      true,
 			wantVersions: []int64{1, 2, 3},
 			wantReverted: []int64{},
 		},
 		{
-			name:  "negative_version",
-			store: &fakeStore{},
-			migrations: []*golumn.Migration{
-				{Version: -1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 0,
-
-			wantVersions: []int64{},
-			wantReverted: []int64{},
-			wantErr:      true,
-		},
-		{
-			name:  "misordered",
-			store: &fakeStore{},
-			migrations: []*golumn.Migration{
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 0,
-
-			wantVersions: []int64{},
-			wantReverted: []int64{},
-			wantErr:      true,
-		},
-		{
-			name:  "duplicate",
-			store: &fakeStore{},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 0,
-
-			wantVersions: []int64{},
-			wantReverted: []int64{},
-			wantErr:      true,
-		},
-		{
-			name: "missing_target_version",
-			store: &fakeStore{
-				versions: []int64{1, 2, 3},
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 5,
-
-			wantVersions: []int64{1, 2, 3},
-			wantReverted: []int64{},
-			wantErr:      true,
-		},
-		{
-			name: "missing_remote_version_migration",
-			store: &fakeStore{
-				versions: []int64{1, 2, 5},
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 1,
-
-			wantVersions: []int64{1, 2, 5},
-			wantReverted: []int64{},
-			wantErr:      true,
-		},
-		{
-			name: "init_err",
-			store: &fakeStore{
-				versions: []int64{1, 2, 3},
-				initFunc: func(ctx context.Context, _ *fakeStore) error { return fmt.Errorf("test init error") },
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 1,
-
-			wantVersions: []int64{1, 2, 3},
-			wantReverted: []int64{},
-			wantErr:      true,
-		},
-		{
-			name: "lock_err",
-			store: &fakeStore{
-				versions: []int64{1, 2, 3},
-				lockFunc: func(ctx context.Context, _ *fakeStore) error { return fmt.Errorf("test lock error") },
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 1,
-
-			wantVersions: []int64{1, 2, 3},
-			wantReverted: []int64{},
-			wantErr:      true,
-		},
-		{
-			name: "release_err",
-			store: &fakeStore{
-				versions:    []int64{1, 2, 3},
-				releaseFunc: func(ctx context.Context, _ *fakeStore) error { return fmt.Errorf("test release error") },
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 1,
-
-			wantVersions: []int64{1},
-			wantReverted: []int64{3, 2},
-			wantLocked:   true,
-			wantErr:      true,
-		},
-		{
-			name: "version_err_first_call",
-			store: &fakeStore{
-				versions:    []int64{1, 2, 3},
-				versionFunc: func(ctx context.Context, s *fakeStore) (int64, error) { return 0, fmt.Errorf("test version error") },
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 1,
-
-			wantVersions: []int64{1, 2, 3},
-			wantReverted: []int64{},
-			wantErr:      true,
-		},
-		{
-			name: "version_err_subsequent_call",
-			store: &fakeStore{
-				versions: []int64{1, 2, 3},
-				versionFunc: func(ctx context.Context, s *fakeStore) (int64, error) {
+			name:            "store_version_error_subsequent",
+			initialVersions: []int64{1, 2, 3},
+			migrations:      createMigrations(1, 2, 3),
+			target:          1,
+			storeConfig: func(s *fakeStore) {
+				s.versionFunc = func(ctx context.Context, s *fakeStore) (int64, error) {
 					if s.versionCalls > 1 {
-						return 0, fmt.Errorf("test version error")
+						return 0, fmt.Errorf("version error")
 					}
 					return defaultVersionFunc(ctx, s)
-				},
+				}
 			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 1,
-
+			wantErr:      true,
 			wantVersions: []int64{1, 2},
 			wantReverted: []int64{3},
-			wantErr:      true,
 		},
 		{
-			name: "remove_err",
-			store: &fakeStore{
-				versions: []int64{1, 2, 3},
-				removeFunc: func(ctx context.Context, v int64, s *fakeStore) error {
-					if s.removeCalls == 2 {
-						return fmt.Errorf("test remove error")
+			name:            "store_remove_error",
+			initialVersions: []int64{1, 2, 3},
+			migrations:      createMigrations(1, 2, 3),
+			target:          1,
+			storeConfig: func(s *fakeStore) {
+				s.removeFunc = func(ctx context.Context, v int64, s *fakeStore) error {
+					if s.removeCalls == 2 { // Fail on second remove
+						return fmt.Errorf("remove error")
 					}
 					return defaultRemoveFunc(ctx, v, s)
-				},
+				}
 			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 1,
-
+			wantErr:      true,
 			wantVersions: []int64{1, 2},
 			wantReverted: []int64{3},
-			wantErr:      true,
 		},
 		{
-			name: "down_err",
-			store: &fakeStore{
-				versions: []int64{1, 2, 3},
-			},
+			name:            "migration_down_error",
+			initialVersions: []int64{1, 2, 3},
 			migrations: []*golumn.Migration{
 				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: func(_ context.Context, _ *sql.DB) error { return fmt.Errorf("test down migration error") }},
+				{Version: 2, UpFunc: noopMigration, DownFunc: errorMigration("down error")},
 				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
 			},
-			to: 1,
-
+			target:       1,
+			wantErr:      true,
 			wantVersions: []int64{1, 2},
 			wantReverted: []int64{3},
-			wantErr:      true,
 		},
 		{
-			name: "down_err_hold_lock",
-			store: &fakeStore{
-				versions: []int64{1, 2, 3},
-			},
+			name:            "migration_down_error_hold_lock",
+			initialVersions: []int64{1, 2, 3},
 			migrations: []*golumn.Migration{
 				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: func(_ context.Context, _ *sql.DB) error { return fmt.Errorf("test down migration error") }},
+				{Version: 2, UpFunc: noopMigration, DownFunc: errorMigration("down error")},
 				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
 			},
+			target:            1,
 			holdLockOnFailure: true,
-			to:                1,
-
-			wantVersions: []int64{1, 2},
-			wantReverted: []int64{3},
-			wantErr:      true,
-			wantLocked:   true,
-		},
-		{
-			name: "initial_version",
-			store: &fakeStore{
-				versions: []int64{},
-			},
-			migrations: []*golumn.Migration{
-				{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
-				{Version: 3, UpFunc: noopMigration, DownFunc: noopMigration},
-			},
-			to: 1,
-
-			wantVersions: []int64{},
-			wantReverted: []int64{},
+			wantErr:           true,
+			wantVersions:      []int64{1, 2},
+			wantReverted:      []int64{3},
+			wantLocked:        true,
 		},
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			m := &golumn.Migrator{
-				Store:             tc.store,
-				Sources:           tc.migrations,
-				HoldLockOnFailure: tc.holdLockOnFailure,
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &fakeStore{
+				versions: slices.Clone(tt.initialVersions),
 			}
-			err := m.Down(context.Background(), tc.to)
-
-			if tc.wantErr && err == nil {
-				t.Errorf("%s: wanted err != nil, but got nil", tc.name)
-			}
-			if !tc.wantErr && err != nil {
-				t.Errorf("%s: wanted err = nil, but got %v", tc.name, err)
+			if tt.storeConfig != nil {
+				tt.storeConfig(store)
 			}
 
-			if !slices.Equal(tc.wantVersions, tc.store.versions) {
-				diff := cmp.Diff(tc.wantVersions, tc.store.versions)
-				t.Errorf("%s: store.versions mismatch (-want, +got):\n%s", tc.name, diff)
+			migrator := &golumn.Migrator{
+				Store:             store,
+				Sources:           tt.migrations,
+				HoldLockOnFailure: tt.holdLockOnFailure,
 			}
 
-			if !slices.Equal(tc.wantReverted, tc.store.reverted) {
-				diff := cmp.Diff(tc.wantReverted, tc.store.reverted)
-				t.Errorf("%s: store.reverted mismatch (-want, +got):\n%s", tc.name, diff)
+			err := migrator.Down(context.Background(), tt.target)
+
+			if tt.wantErr && err == nil {
+				t.Errorf("expected error but got none")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("expected no error but got: %v", err)
 			}
 
-			if tc.wantLocked != tc.store.locked {
-				t.Errorf("%s: wanted store.locked = %v, but got %v", tc.name, tc.wantLocked, tc.store.locked)
+			if !slices.Equal(tt.wantVersions, store.versions) {
+				t.Errorf("versions mismatch\nwant: %v\ngot:  %v", tt.wantVersions, store.versions)
+			}
+			if !slices.Equal(tt.wantReverted, store.reverted) {
+				t.Errorf("reverted mismatch\nwant: %v\ngot:  %v", tt.wantReverted, store.reverted)
+			}
+			if tt.wantLocked != store.locked {
+				t.Errorf("lock state mismatch: want %v, got %v", tt.wantLocked, store.locked)
+			}
+		})
+	}
+}
+
+func TestMigrator_ValidationConsistency(t *testing.T) {
+	invalidMigrations := [][]*golumn.Migration{
+		{
+			{Version: -1, UpFunc: noopMigration, DownFunc: noopMigration},
+		},
+		{
+			{Version: 2, UpFunc: noopMigration, DownFunc: noopMigration},
+			{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
+		},
+		{
+			{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
+			{Version: 1, UpFunc: noopMigration, DownFunc: noopMigration},
+		},
+	}
+
+	for i, migrations := range invalidMigrations {
+		t.Run(fmt.Sprintf("invalid_migrations_%d", i), func(t *testing.T) {
+			store := &fakeStore{}
+			migrator := &golumn.Migrator{
+				Store:   store,
+				Sources: migrations,
+			}
+
+			// Both Up and Down should fail validation consistently
+			upErr := migrator.Up(context.Background(), 1)
+			downErr := migrator.Down(context.Background(), 0)
+
+			if upErr == nil {
+				t.Error("Up should have failed validation")
+			}
+			if downErr == nil {
+				t.Error("Down should have failed validation")
+			}
+
+			// Store should not have been touched
+			if store.initCalls > 0 || store.lockCalls > 0 {
+				t.Error("Store should not be accessed when validation fails")
+			}
+		})
+	}
+}
+
+func TestMigrator_InitialVersionHandling(t *testing.T) {
+	t.Run("up_from_initial_version", func(t *testing.T) {
+		store := &fakeStore{versions: []int64{}}
+		migrator := &golumn.Migrator{
+			Store:   store,
+			Sources: createMigrations(1, 2),
+		}
+
+		err := migrator.Up(context.Background(), 2)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		want := []int64{1, 2}
+		if !slices.Equal(want, store.versions) {
+			t.Errorf("want %v, got %v", want, store.versions)
+		}
+	})
+
+	t.Run("down_from_initial_version", func(t *testing.T) {
+		store := &fakeStore{versions: []int64{}}
+		migrator := &golumn.Migrator{
+			Store:   store,
+			Sources: createMigrations(1, 2),
+		}
+
+		err := migrator.Down(context.Background(), 1)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(store.reverted) > 0 {
+			t.Errorf("expected no reversions, got %v", store.reverted)
+		}
+	})
+}
+
+func TestMigrator_LockBehavior(t *testing.T) {
+	t.Run("successful_operations_release_lock", func(t *testing.T) {
+		store := &fakeStore{}
+		migrator := &golumn.Migrator{
+			Store:   store,
+			Sources: createMigrations(1, 2),
+		}
+
+		err := migrator.Up(context.Background(), 2)
+		if err != nil {
+			t.Fatalf("Up failed: %v", err)
+		}
+
+		if store.lockCalls != 1 || store.releaseCalls != 1 {
+			t.Errorf("expected 1 lock/release call, got %d/%d", store.lockCalls, store.releaseCalls)
+		}
+		if store.locked {
+			t.Error("lock should be released after successful operation")
+		}
+
+		err = migrator.Down(context.Background(), 1)
+		if err != nil {
+			t.Fatalf("Down failed: %v", err)
+		}
+
+		if store.lockCalls != 2 || store.releaseCalls != 2 {
+			t.Errorf("expected 2 lock/release calls, got %d/%d", store.lockCalls, store.releaseCalls)
+		}
+		if store.locked {
+			t.Error("lock should be released after successful operation")
+		}
+	})
+
+	t.Run("hold_lock_on_failure_flag", func(t *testing.T) {
+		tests := []struct {
+			name     string
+			holdLock bool
+			wantLock bool
+		}{
+			{"default_behavior", false, false},
+			{"hold_lock_enabled", true, true},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				store := &fakeStore{}
+				migrator := &golumn.Migrator{
+					Store: store,
+					Sources: []*golumn.Migration{
+						{Version: 1, UpFunc: errorMigration("test error"), DownFunc: noopMigration},
+					},
+					HoldLockOnFailure: tt.holdLock,
+				}
+
+				err := migrator.Up(context.Background(), 1)
+				if err == nil {
+					t.Error("expected error from migration")
+				}
+
+				if store.locked != tt.wantLock {
+					t.Errorf("lock state: want %v, got %v", tt.wantLock, store.locked)
+				}
+			})
+		}
+	})
+}
+
+func TestMigrator_StoreCallPatterns(t *testing.T) {
+	t.Run("up_call_sequence", func(t *testing.T) {
+		store := &fakeStore{}
+		migrator := &golumn.Migrator{
+			Store:   store,
+			Sources: createMigrations(1, 2),
+		}
+
+		err := migrator.Up(context.Background(), 2)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if store.initCalls != 1 {
+			t.Errorf("expected 1 init call, got %d", store.initCalls)
+		}
+		if store.lockCalls != 1 {
+			t.Errorf("expected 1 lock call, got %d", store.lockCalls)
+		}
+		if store.versionCalls != 1 {
+			t.Errorf("expected 1 version call, got %d", store.versionCalls)
+		}
+		if store.insertCalls != 2 {
+			t.Errorf("expected 2 insert calls, got %d", store.insertCalls)
+		}
+		if store.releaseCalls != 1 {
+			t.Errorf("expected 1 release call, got %d", store.releaseCalls)
+		}
+	})
+
+	t.Run("down_call_sequence", func(t *testing.T) {
+		store := &fakeStore{
+			versions: []int64{1, 2, 3},
+		}
+		migrator := &golumn.Migrator{
+			Store:   store,
+			Sources: createMigrations(1, 2, 3),
+		}
+
+		err := migrator.Down(context.Background(), 1)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		expectedVersionCalls := 3
+		if store.versionCalls != expectedVersionCalls {
+			t.Errorf("expected %d version calls, got %d", expectedVersionCalls, store.versionCalls)
+		}
+		if store.removeCalls != 2 {
+			t.Errorf("expected 2 remove calls, got %d", store.removeCalls)
+		}
+	})
+}
+
+func TestMigrator_BoundaryConditions(t *testing.T) {
+	t.Run("zero_target_version", func(t *testing.T) {
+		store := &fakeStore{}
+		migrator := &golumn.Migrator{
+			Store:   store,
+			Sources: createMigrations(1, 2, 3),
+		}
+
+		err := migrator.Up(context.Background(), 0)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(store.applied) > 0 {
+			t.Errorf("expected no migrations applied, got %v", store.applied)
+		}
+	})
+
+	t.Run("very_high_target_version", func(t *testing.T) {
+		store := &fakeStore{}
+		migrator := &golumn.Migrator{
+			Store:   store,
+			Sources: createMigrations(1, 2, 3),
+		}
+
+		err := migrator.Up(context.Background(), 9999)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		want := []int64{1, 2, 3}
+		if !slices.Equal(want, store.applied) {
+			t.Errorf("want %v, got %v", want, store.applied)
+		}
+	})
+
+	t.Run("single_migration", func(t *testing.T) {
+		store := &fakeStore{versions: []int64{1, 2}}
+		migrator := &golumn.Migrator{
+			Store:   store,
+			Sources: createMigrations(1, 2, 3),
+		}
+
+		err := migrator.Up(context.Background(), 3)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		want := []int64{3}
+		if !slices.Equal(want, store.applied) {
+			t.Errorf("want %v, got %v", want, store.applied)
+		}
+	})
+}
+
+func TestMigrator_ConcurrentSafety(t *testing.T) {
+	t.Run("concurrent_lock_attempts", func(t *testing.T) {
+		store := &fakeStore{}
+		migrator := &golumn.Migrator{
+			Store:   store,
+			Sources: createMigrations(1),
+		}
+
+		err := store.Lock(context.Background())
+		if err != nil {
+			t.Fatalf("failed to pre-lock store: %v", err)
+		}
+
+		err = migrator.Up(context.Background(), 1)
+		if err == nil {
+			t.Error("expected error when store is already locked")
+		}
+		if !store.locked {
+			t.Error("store should remain locked")
+		}
+	})
+}
+
+func TestMigrator_Integration(t *testing.T) {
+	store := &fakeStore{}
+	migrations := createMigrations(1, 2, 3, 4, 5)
+	migrator := &golumn.Migrator{
+		Store:   store,
+		Sources: migrations,
+	}
+
+	steps := []struct {
+		target   int64
+		wantVers []int64
+	}{
+		{2, []int64{1, 2}},
+		{4, []int64{1, 2, 3, 4}},
+		{5, []int64{1, 2, 3, 4, 5}},
+	}
+
+	for i, step := range steps {
+		t.Run(fmt.Sprintf("step_%d_to_%d", i+1, step.target), func(t *testing.T) {
+			err := migrator.Up(context.Background(), step.target)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if !slices.Equal(step.wantVers, store.versions) {
+				t.Errorf("want %v, got %v", step.wantVers, store.versions)
+			}
+		})
+	}
+
+	rollbackSteps := []struct {
+		target   int64
+		wantVers []int64
+	}{
+		{3, []int64{1, 2, 3}},
+		{1, []int64{1}},
+		{-1, []int64{}},
+	}
+
+	for i, step := range rollbackSteps {
+		t.Run(fmt.Sprintf("rollback_%d_to_%d", i+1, step.target), func(t *testing.T) {
+			err := migrator.Down(context.Background(), step.target)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if !slices.Equal(step.wantVers, store.versions) {
+				t.Errorf("want %v, got %v", step.wantVers, store.versions)
 			}
 		})
 	}

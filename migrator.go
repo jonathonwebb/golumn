@@ -8,6 +8,11 @@ import (
 	"slices"
 )
 
+const (
+	UpTargetLatest    = -1
+	DownTargetInitial = -1
+)
+
 type Migrator struct {
 	Store   Store
 	Sources []*Migration

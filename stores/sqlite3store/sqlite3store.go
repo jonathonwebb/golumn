@@ -15,7 +15,7 @@ type Sqlite3Store struct {
 
 var _ golumn.Store = (*Sqlite3Store)(nil)
 
-func NewSqlite3Store(db *sql.DB) *Sqlite3Store {
+func New(db *sql.DB) *Sqlite3Store {
 	return &Sqlite3Store{db}
 }
 
@@ -25,11 +25,11 @@ func (s *Sqlite3Store) DB() *sql.DB {
 
 func (s *Sqlite3Store) Init(ctx context.Context) error {
 	if err := s.withTx(ctx, func(tCtx context.Context, tx *sql.Tx) error {
-		if _, err := s.instance.ExecContext(tCtx, "CREATE TABLE IF NOT EXISTS schema_lock (id INTEGER PRIMARY KEY)"); err != nil {
+		if _, err := tx.ExecContext(tCtx, "CREATE TABLE IF NOT EXISTS schema_lock (id INTEGER PRIMARY KEY)"); err != nil {
 			return err
 		}
 
-		if _, err := s.instance.ExecContext(tCtx, "CREATE TABLE IF NOT EXISTS schema_migrations (id INTEGER PRIMARY KEY, version_id INTEGER UNIQUE NOT NULL, applied_at DATETIME NOT NULL DEFAULT (datetime('now')))"); err != nil {
+		if _, err := tx.ExecContext(tCtx, "CREATE TABLE IF NOT EXISTS schema_migrations (id INTEGER PRIMARY KEY, version_id INTEGER UNIQUE NOT NULL, applied_at DATETIME NOT NULL DEFAULT (datetime('now')))"); err != nil {
 			return err
 		}
 		return nil
@@ -92,18 +92,18 @@ func (s *Sqlite3Store) withTx(ctx context.Context, fn func(context.Context, *sql
 	if err != nil {
 		return err
 	}
+
 	defer func() {
-		err = errors.Join(err, tx.Rollback())
+		if err != nil {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil {
+				err = errors.Join(err, rollbackErr)
+			}
+		} else {
+			if commitErr := tx.Commit(); commitErr != nil {
+				err = errors.Join(err, commitErr)
+			}
+		}
 	}()
 
-	err = fn(ctx, tx)
-	if err != nil {
-		return err
-	}
-
-	if err = tx.Commit(); err != nil {
-		return err
-	}
-
-	return nil
+	return fn(ctx, tx)
 }
