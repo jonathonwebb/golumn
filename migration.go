@@ -8,6 +8,7 @@ import (
 
 type Migration struct {
 	Version  int64
+	Name     string
 	UpFunc   func(context.Context, *sql.DB) error
 	DownFunc func(context.Context, *sql.DB) error
 }

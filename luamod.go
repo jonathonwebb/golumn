@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"time"
 
 	lua "github.com/yuin/gopher-lua"
+	"github.com/yuin/gopher-lua/parse"
 )
 
 const (
@@ -14,6 +16,91 @@ const (
 	luaTransactionTypeName = "transaction"
 	luaResultTypeName      = "result"
 )
+
+func Parse(ctx context.Context, r io.Reader, name string) (*Migration, error) {
+	proto, err := compileLua(r, name)
+	if err != nil {
+		return nil, err
+	}
+
+	l := lua.NewState()
+	defer l.Close()
+	l.SetContext(ctx)
+	l.PreloadModule("db", LoaderFunc(nil))
+
+	if err := doCompiled(l, proto); err != nil {
+		return nil, err
+	}
+
+	lv := l.GetGlobal("Version")
+	version, ok := lv.(lua.LNumber)
+	if !ok {
+		return nil, fmt.Errorf("expected Version global to be a number, got %T", lv)
+	}
+
+	return &Migration{
+		Version: int64(version),
+		Name:    name,
+		UpFunc: func(ctx context.Context, db *sql.DB) error {
+			l := lua.NewState()
+			defer l.Close()
+			l.SetContext(ctx)
+			l.PreloadModule("db", LoaderFunc(db))
+
+			if err := doCompiled(l, proto); err != nil {
+				return err
+			}
+
+			if err := l.CallByParam(lua.P{
+				Fn:      l.GetGlobal("Up"),
+				NRet:    0,
+				Protect: true,
+			}); err != nil {
+				return err
+			}
+
+			return nil
+		},
+		DownFunc: func(ctx context.Context, db *sql.DB) error {
+			l := lua.NewState()
+			defer l.Close()
+			l.SetContext(ctx)
+			l.PreloadModule("db", LoaderFunc(db))
+
+			if err := doCompiled(l, proto); err != nil {
+				return err
+			}
+
+			if err := l.CallByParam(lua.P{
+				Fn:      l.GetGlobal("Down"),
+				NRet:    0,
+				Protect: true,
+			}); err != nil {
+				return err
+			}
+
+			return nil
+		},
+	}, nil
+}
+
+func compileLua(r io.Reader, name string) (*lua.FunctionProto, error) {
+	chunk, err := parse.Parse(r, name)
+	if err != nil {
+		return nil, err
+	}
+	proto, err := lua.Compile(chunk, name)
+	if err != nil {
+		return nil, err
+	}
+	return proto, nil
+}
+
+func doCompiled(L *lua.LState, proto *lua.FunctionProto) error {
+	lfunc := L.NewFunctionFromProto(proto)
+	L.Push(lfunc)
+	return L.PCall(0, lua.MultRet, nil)
+}
 
 func LoaderFunc(db *sql.DB) func(L *lua.LState) int {
 	exports := map[string]lua.LGFunction{
