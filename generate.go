@@ -16,7 +16,7 @@ Version={{.Version}}
 function Up()
     local tx = db.begin()
     local ok, err = pcall(function()
-        error("{{.Name}}: up migration not implemented")
+        error("up migration not implemented")
     end)
     if not ok then
         tx:rollback()
@@ -27,7 +27,7 @@ end
 function Down()
     local tx = db.begin()
     local ok, err = pcall(function()
-        error("{{.Name}}: down migration not implemented")
+        error("down migration not implemented")
     end)
     if not ok then
         tx:rollback()

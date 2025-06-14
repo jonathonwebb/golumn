@@ -26,7 +26,7 @@ func Parse(ctx context.Context, r io.Reader, name string) (*Migration, error) {
 	l := lua.NewState()
 	defer l.Close()
 	l.SetContext(ctx)
-	l.PreloadModule("db", LoaderFunc(nil))
+	l.PreloadModule("db", loaderFunc(nil))
 
 	if err := doCompiled(l, proto); err != nil {
 		return nil, err
@@ -45,7 +45,7 @@ func Parse(ctx context.Context, r io.Reader, name string) (*Migration, error) {
 			l := lua.NewState()
 			defer l.Close()
 			l.SetContext(ctx)
-			l.PreloadModule("db", LoaderFunc(db))
+			l.PreloadModule("db", loaderFunc(db))
 
 			if err := doCompiled(l, proto); err != nil {
 				return err
@@ -65,7 +65,7 @@ func Parse(ctx context.Context, r io.Reader, name string) (*Migration, error) {
 			l := lua.NewState()
 			defer l.Close()
 			l.SetContext(ctx)
-			l.PreloadModule("db", LoaderFunc(db))
+			l.PreloadModule("db", loaderFunc(db))
 
 			if err := doCompiled(l, proto); err != nil {
 				return err
@@ -102,7 +102,7 @@ func doCompiled(L *lua.LState, proto *lua.FunctionProto) error {
 	return L.PCall(0, lua.MultRet, nil)
 }
 
-func LoaderFunc(db *sql.DB) func(L *lua.LState) int {
+func loaderFunc(db *sql.DB) func(L *lua.LState) int {
 	exports := map[string]lua.LGFunction{
 		"begin": luaBeginFunc(db),
 		"exec":  luaExecFunc(db),
